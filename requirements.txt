@@ -4,5 +4,5 @@ pdf2image
 pytesseract
 PyMuPDF
 pandas
-opencv-python
+opencv-python-headless
 numpy
