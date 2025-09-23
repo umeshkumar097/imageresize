@@ -4,3 +4,7 @@ pdf2image
 pytesseract
 PyMuPDF
 pandas
+opencv-python
+numpy
+poppler
+tesseract-ocr
