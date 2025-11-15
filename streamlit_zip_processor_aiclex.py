@@ -16,6 +16,7 @@ import os
 import zipfile
 import shutil
 import tempfile
+import subprocess
 from pathlib import Path
 from PIL import Image, ImageOps, ImageEnhance
 import cv2
@@ -75,7 +76,8 @@ else:  # Linux/macOS (for cloud deployment)
         version = pytesseract.get_tesseract_version()
         TESSERACT_AVAILABLE = True
         print(f"✅ Tesseract {version} found in PATH")
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Tesseract not in PATH: {type(e).__name__}: {str(e)}")
         # Try common Linux/Unix paths
         unix_paths = [
             '/usr/bin/tesseract',
@@ -85,6 +87,7 @@ else:  # Linux/macOS (for cloud deployment)
         found = False
         for path in unix_paths:
             if os.path.exists(path):
+                print(f"   Trying path: {path}")
                 pytesseract.pytesseract.tesseract_cmd = path
                 try:
                     version = pytesseract.get_tesseract_version()
@@ -92,12 +95,46 @@ else:  # Linux/macOS (for cloud deployment)
                     print(f"✅ Auto-detected Tesseract {version} at: {path}")
                     found = True
                     break
-                except Exception:
+                except Exception as path_err:
+                    print(f"   Path {path} exists but failed: {type(path_err).__name__}: {str(path_err)}")
                     continue
+        
+        # If still not found, try using 'which' or 'whereis' command
+        if not found:
+            print("   Attempting to find tesseract using system commands...")
+            for cmd in ['which', 'whereis']:
+                try:
+                    result = subprocess.run([cmd, 'tesseract'], capture_output=True, text=True, timeout=2)
+                    if result.returncode == 0:
+                        tesseract_path = result.stdout.strip()
+                        if cmd == 'whereis':
+                            # whereis returns: tesseract: /usr/bin/tesseract
+                            parts = tesseract_path.split()
+                            if len(parts) > 1:
+                                tesseract_path = parts[1]
+                            else:
+                                continue
+                        
+                        if os.path.exists(tesseract_path):
+                            print(f"   Found tesseract at: {tesseract_path} (via {cmd})")
+                            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+                            try:
+                                version = pytesseract.get_tesseract_version()
+                                TESSERACT_AVAILABLE = True
+                                print(f"✅ Tesseract {version} found via '{cmd}' command")
+                                found = True
+                                break
+                            except Exception as cmd_err:
+                                print(f"   Command found path but failed: {type(cmd_err).__name__}: {str(cmd_err)}")
+                                continue
+                except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as cmd_err:
+                    continue
+        
         if not found:
             print("⚠️ Tesseract not found. OCR features will be disabled.")
             print("   On Linux, install with: sudo apt install tesseract-ocr")
-            print("   On macOS, install with: brew install tesseract") 
+            print("   On macOS, install with: brew install tesseract")
+            print("   For Streamlit Cloud, ensure packages.txt contains: tesseract-ocr") 
 
 
 try:
