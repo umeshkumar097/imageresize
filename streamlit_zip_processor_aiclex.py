@@ -16,7 +16,51 @@ import numpy as np
 import pytesseract
 import uuid
 
-# Make sure your Tesseract path is set 
+# --- Tesseract Path Configuration ---
+# Set Tesseract path explicitly
+TESSERACT_PATH = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# Initialize Tesseract path and verify it works
+TESSERACT_AVAILABLE = False
+if os.path.exists(TESSERACT_PATH):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    try:
+        # Verify Tesseract actually works
+        version = pytesseract.get_tesseract_version()
+        TESSERACT_AVAILABLE = True
+        print(f"✅ Tesseract {version} configured at: {TESSERACT_PATH}")
+    except Exception as e:
+        print(f"⚠️ Tesseract path set but not working: {e}")
+        TESSERACT_AVAILABLE = False
+else:
+    # Try to auto-detect Tesseract path on Windows if not found at specified location
+    if os.name == 'nt':  # Windows
+        try:
+            # Test if Tesseract is accessible in PATH
+            version = pytesseract.get_tesseract_version()
+            TESSERACT_AVAILABLE = True
+            print(f"✅ Tesseract {version} found in PATH")
+        except Exception:
+            # Tesseract not in PATH, try to find it in common locations
+            common_paths = [
+                r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+                r'C:\Users\{}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe'.format(os.getenv('USERNAME', '')),
+            ]
+            found = False
+            for path in common_paths:
+                if os.path.exists(path):
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    try:
+                        version = pytesseract.get_tesseract_version()
+                        TESSERACT_AVAILABLE = True
+                        print(f"✅ Auto-detected Tesseract {version} at: {path}")
+                        found = True
+                        break
+                    except Exception:
+                        continue
+            if not found:
+                print("⚠️ Tesseract not found. OCR features will be disabled.") 
 
 
 try:
@@ -188,13 +232,12 @@ import os
 def detect_and_crop_aadhaar_front(image_path, save_path):
     """
     Detect and crop Aadhaar front side intelligently.
-    Uses both filename keywords and OCR-based detection.
+    Uses face detection to locate and crop the front side of Aadhaar card.
     """
 
     # ✅ Step 0: Quick filename-based Aadhaar check
     filename = os.path.basename(image_path).lower()
     aadhaar_file_keywords = ["aadhaar", "aadhar", "adhar"]
-
     aadhaar_in_name = any(k in filename for k in aadhaar_file_keywords)
 
     # --- Step 1: Load and preprocess image ---
@@ -204,43 +247,105 @@ def detect_and_crop_aadhaar_front(image_path, save_path):
         return False
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Preprocess image to improve face detection (handle blur and enhance contrast)
+    # Apply sharpening to reduce blur effect
+    kernel = np.array([[-1,-1,-1],
+                       [-1, 9,-1],
+                       [-1,-1,-1]])
+    sharpened = cv2.filter2D(gray, -1, kernel)
+    
+    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) for better detection
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(sharpened)
+    
+    # Use both original and enhanced for detection
+    gray_for_detection = enhanced
 
-    # Run OCR only if Aadhaar not detected in filename
-    if not aadhaar_in_name:
-        text = pytesseract.image_to_string(gray)
-        front_keywords = [
-            "government of india",
-            "unique identification",
-            "aadhaar",
-            "aadhar",
-            "adhar",
-            "dob",
-            "vid:"
-        ]
-        if not any(k in text.lower() for k in front_keywords):
-            print("❌ Aadhaar front not detected by OCR or filename.")
-            return False
-    else:
-        print("📄 Aadhaar detected from filename — proceeding with cropping.")
+    # --- Step 2: Optional OCR validation (only if available) ---
+    front_detected = False
+    if TESSERACT_AVAILABLE:
+        try:
+            text = pytesseract.image_to_string(gray).lower()
+            front_keywords = [
+                "government of india",
+                "unique identification",
+                "aadhaar",
+                "aadhar",
+                "adhar",
+                "dob",
+                "date of birth",
+                "male",
+                "female"
+            ]
+            front_detected = any(k in text for k in front_keywords)
+            if front_detected:
+                print("✅ Aadhaar FRONT side detected by OCR.")
+        except Exception as e:
+            print(f"⚠️ OCR validation skipped: {e}")
 
-    # --- Step 2: Face detection to locate photo region ---
+    # If filename doesn't indicate Aadhaar and OCR doesn't detect front, skip
+    if not aadhaar_in_name and not front_detected:
+        print("⚠️ Aadhaar not detected in filename or OCR. Skipping Aadhaar crop.")
+        return False
+
+    # --- Step 3: Face detection to locate photo region (front side has face) ---
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
-
-    if len(faces) > 0:
-        (x, y, w, h) = faces[0]
-        # Expand around face region
-        x1 = max(x - 80, 0)
-        y1 = max(y - 120, 0)
-        x2 = min(x + w + 400, img.shape[1])
-        y2 = min(y + h + 200, img.shape[0])
+    
+    # Try multiple detection parameters for better results
+    # First try with enhanced image and relaxed parameters
+    faces1 = face_cascade.detectMultiScale(gray_for_detection, scaleFactor=1.1, minNeighbors=4, minSize=(50, 50), maxSize=(300, 300))
+    # Also try with original image
+    faces2 = face_cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=5, minSize=(50, 50), maxSize=(300, 300))
+    
+    # Combine and deduplicate faces
+    all_faces = []
+    seen_faces = set()
+    
+    for face in list(faces1) + list(faces2):
+        x, y, w, h = face
+        # Create a unique key for this face region
+        face_key = (x // 20, y // 20, w // 20, h // 20)  # Round to avoid duplicates
+        if face_key not in seen_faces:
+            seen_faces.add(face_key)
+            all_faces.append((x, y, w, h))
+    
+    if len(all_faces) > 0:
+        # Choose the best face: prefer larger faces, and faces in lower portion (actual Aadhaar card)
+        img_height = img.shape[0]
+        
+        def face_score(face):
+            x, y, w, h = face
+            area = w * h
+            # Prefer faces in lower 70% of image (where actual Aadhaar card usually is)
+            position_score = 1.0 if y > img_height * 0.3 else 0.5
+            # Prefer larger faces (actual photo, not small preview)
+            size_score = area / (img.shape[0] * img.shape[1])
+            return size_score * position_score
+        
+        # Sort by score and pick the best one
+        all_faces.sort(key=face_score, reverse=True)
+        best_face = all_faces[0]
+        (x, y, w, h) = best_face
+        
+        if len(all_faces) > 1:
+            print(f"✅ Multiple faces detected ({len(all_faces)}). Selected largest/clearest face for cropping.")
+        
+        # Expand around face region with increased margins (front side has face on left)
+        x1 = max(x - 150, 0)  # Increased left margin from 80 to 150
+        y1 = max(y - 200, 0)  # Increased top margin from 120 to 200
+        x2 = min(x + w + 600, img.shape[1])  # Increased right margin from 400 to 600
+        y2 = min(y + h + 300, img.shape[0])  # Increased bottom margin from 200 to 300
         crop = img[y1:y2, x1:x2]
+        print(f"✅ Face detected (size: {w}x{h}) - cropping around face region (front side) with increased margins.")
     else:
-        # Fallback: crop center region if no face detected
+        # Fallback: crop left portion with increased margins (front side typically has photo on left)
         h, w = img.shape[:2]
-        crop = img[int(h * 0.2):int(h * 0.8), int(w * 0.1):int(w * 0.9)]
+        # Front side: photo on left, crop with more margin (increased from 5%-65% to 3%-70% width, 5%-95% height)
+        crop = img[int(h * 0.05):int(h * 0.95), int(w * 0.03):int(w * 0.70)]
+        print("⚠️ No face detected - cropping left portion (assuming front side) with increased margins.")
 
-    # --- Step 3: Save cropped Aadhaar front ---
+    # --- Step 4: Save cropped Aadhaar front ---
     im = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
     im.save(save_path, "JPEG", quality=90)
 
@@ -301,7 +406,7 @@ def process_tree(source_dir, processed_dir, status_placeholder):
         if ext in SUPPORTED_MEDIA_EXT:
             temp_jpg_path = Path(tempfile.gettempdir()) / f"temp_{uuid.uuid4().hex}_{relative_path.name}.jpg"
             if not convert_any_to_jpg(input_path, temp_jpg_path):
-                report_data.append([relative_path, 'unknown', f"{original_kb:.2f}", 0, "convert_failed", "name"])
+                report_data.append([str(relative_path), 'unknown', f"{original_kb:.2f}", 0, "convert_failed", "name"])
                 continue
 
             category = guess_category_by_filename(input_path.name)
@@ -328,8 +433,19 @@ def process_tree(source_dir, processed_dir, status_placeholder):
             output_path = (processed_dir / relative_path).with_suffix(".jpg")
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
-            status, final_kb = compress_jpg_to_target(temp_jpg_path, output_path, min_kb, max_kb)
-            report_data.append([relative_path, category, f"{original_kb:.2f}", f"{final_kb:.2f}", status, "name"])
+            # Check if file is already within target size range (after any cropping)
+            current_size_kb = temp_jpg_path.stat().st_size / 1024
+            
+            if min_kb <= current_size_kb <= max_kb:
+                # File is already within target size - copy as-is without compression
+                shutil.copy(temp_jpg_path, output_path)
+                final_kb = output_path.stat().st_size / 1024
+                status = "copied_as_is"
+                report_data.append([str(relative_path), category, f"{original_kb:.2f}", f"{final_kb:.2f}", status, "name"])
+            else:
+                # File is outside target size - compress to target
+                status, final_kb = compress_jpg_to_target(temp_jpg_path, output_path, min_kb, max_kb)
+                report_data.append([str(relative_path), category, f"{original_kb:.2f}", f"{final_kb:.2f}", status, "name"])
 
             try:
                 if temp_jpg_path.exists():
@@ -341,7 +457,7 @@ def process_tree(source_dir, processed_dir, status_placeholder):
             output_path = processed_dir / relative_path
             output_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(input_path, output_path)
-            report_data.append([relative_path, 'document', f"{original_kb:.2f}", f"{original_kb:.2f}", 'copied_as_is', 'name'])
+            report_data.append([str(relative_path), 'document', f"{original_kb:.2f}", f"{original_kb:.2f}", 'copied_as_is', 'name'])
 
         progress_bar.progress((i + 1) / len(files_to_process))
 
@@ -356,6 +472,12 @@ st.caption("Developed by Aiclex Technologies | aiclex.in")
 
 if not PDF_SUPPORT:
     st.error("PDF processing is disabled. Install 'poppler-utils' for PDF support.")
+
+# Show Tesseract OCR status
+if TESSERACT_AVAILABLE:
+    st.success("✅ Tesseract OCR is available and configured")
+else:
+    st.warning("⚠️ Tesseract OCR is not available. Aadhaar front/back validation will be limited. Install Tesseract for full OCR support.")
 
 uploaded_file = st.file_uploader("📦 Upload your .zip file", type=["zip"], help="Upload a ZIP containing all your documents")
 
@@ -415,7 +537,7 @@ if st.session_state.get("processed", False):
     st.header("📊 Processing Report")
     st.dataframe(st.session_state.df_report)
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with open(st.session_state.output_zip_path, "rb") as fp:
         c1.download_button(
             label="📂 Download Processed ZIP",
@@ -431,3 +553,8 @@ if st.session_state.get("processed", False):
             file_name=f"processing_report_{st.session_state.base_name}.csv",
             mime='text/csv'
         )
+    
+    if c3.button("🔄 Reprocess File", help="Reprocess the uploaded file"):
+        st.session_state.processed = False
+        st.session_state.start_processing = True
+        st.rerun()
