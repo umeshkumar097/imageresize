@@ -2,6 +2,13 @@
 # Author: Aiclex Technologies (aiclex.in)
 # Version: 1.4.1 (Signature Auto-Crop Enhanced + Quality Safe) + Aadhaar OCR-crop
 # ---------------------------------------------------
+#
+# IMPORTANT: Tesseract OCR Installation Required
+# - For Aadhaar card detection, Tesseract OCR must be installed
+# - See TESSERACT_SETUP.md for installation instructions
+# - For cloud deployment, see DEPLOYMENT.md
+# - If Tesseract is not installed, update TESSERACT_PATH below (line 21)
+# ---------------------------------------------------
 
 import streamlit as st
 import pandas as pd
@@ -17,31 +24,31 @@ import pytesseract
 import uuid
 
 # --- Tesseract Path Configuration ---
-# Set Tesseract path explicitly
+# Set Tesseract path explicitly (Windows default)
 TESSERACT_PATH = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 # Initialize Tesseract path and verify it works
 TESSERACT_AVAILABLE = False
-if os.path.exists(TESSERACT_PATH):
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
-    try:
-        # Verify Tesseract actually works
-        version = pytesseract.get_tesseract_version()
-        TESSERACT_AVAILABLE = True
-        print(f"✅ Tesseract {version} configured at: {TESSERACT_PATH}")
-    except Exception as e:
-        print(f"⚠️ Tesseract path set but not working: {e}")
-        TESSERACT_AVAILABLE = False
-else:
-    # Try to auto-detect Tesseract path on Windows if not found at specified location
-    if os.name == 'nt':  # Windows
+
+# Platform-specific detection
+if os.name == 'nt':  # Windows
+    # Windows paths
+    if os.path.exists(TESSERACT_PATH):
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
         try:
-            # Test if Tesseract is accessible in PATH
+            version = pytesseract.get_tesseract_version()
+            TESSERACT_AVAILABLE = True
+            print(f"✅ Tesseract {version} configured at: {TESSERACT_PATH}")
+        except Exception as e:
+            print(f"⚠️ Tesseract path set but not working: {e}")
+            TESSERACT_AVAILABLE = False
+    else:
+        # Try to auto-detect Tesseract path on Windows
+        try:
             version = pytesseract.get_tesseract_version()
             TESSERACT_AVAILABLE = True
             print(f"✅ Tesseract {version} found in PATH")
         except Exception:
-            # Tesseract not in PATH, try to find it in common locations
             common_paths = [
                 r'C:\Program Files\Tesseract-OCR\tesseract.exe',
                 r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
@@ -60,7 +67,37 @@ else:
                     except Exception:
                         continue
             if not found:
-                print("⚠️ Tesseract not found. OCR features will be disabled.") 
+                print("⚠️ Tesseract not found. OCR features will be disabled.")
+else:  # Linux/macOS (for cloud deployment)
+    # On Linux/Unix systems, Tesseract is usually in PATH
+    # Common paths: /usr/bin/tesseract, /usr/local/bin/tesseract
+    try:
+        version = pytesseract.get_tesseract_version()
+        TESSERACT_AVAILABLE = True
+        print(f"✅ Tesseract {version} found in PATH")
+    except Exception:
+        # Try common Linux/Unix paths
+        unix_paths = [
+            '/usr/bin/tesseract',
+            '/usr/local/bin/tesseract',
+            '/opt/homebrew/bin/tesseract',  # macOS Homebrew
+        ]
+        found = False
+        for path in unix_paths:
+            if os.path.exists(path):
+                pytesseract.pytesseract.tesseract_cmd = path
+                try:
+                    version = pytesseract.get_tesseract_version()
+                    TESSERACT_AVAILABLE = True
+                    print(f"✅ Auto-detected Tesseract {version} at: {path}")
+                    found = True
+                    break
+                except Exception:
+                    continue
+        if not found:
+            print("⚠️ Tesseract not found. OCR features will be disabled.")
+            print("   On Linux, install with: sudo apt install tesseract-ocr")
+            print("   On macOS, install with: brew install tesseract") 
 
 
 try:
