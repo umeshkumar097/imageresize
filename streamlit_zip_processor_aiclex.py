@@ -157,9 +157,9 @@ if "base_name" not in st.session_state:
 
 # --- CONFIG ---
 TARGET_SIZES_KB = {
-    "id_proof": (10, 24),
-    "photo": (10, 24),
-    "signature": (10, 24),
+    "id_proof": (10, 20),
+    "photo": (10, 20),
+    "signature": (10, 20),
     "qualification_proof": (50, 200),
     "unknown": (10, 500)
 }
@@ -247,7 +247,7 @@ def convert_any_to_jpg(input_path, output_jpg_path):
         return False
 
 
-# ✅ IMPROVED SIGNATURE AUTO-CROP LOGIC
+# Improved signature auto-crop logic
 def autocrop_signature_image(image_path, save_path):
     """
     Robust auto-cropping for signature images, ignoring watermark text at bottom.
