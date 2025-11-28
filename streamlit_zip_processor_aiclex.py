@@ -181,6 +181,7 @@ CATEGORY_KEYWORDS = {
 
 SUPPORTED_MEDIA_EXT = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.pdf']
 MIN_QUALITY = 10
+PHOTO_MAX_DIM = 1600
 DPI = 200
 
 # --- CORE FUNCTIONS ---
@@ -247,6 +248,100 @@ def convert_any_to_jpg(input_path, output_jpg_path):
         return False
 
 
+def shrink_photo_if_needed(image_path, max_dim=PHOTO_MAX_DIM):
+    """
+    Downscale oversized photos before compression to avoid heavy quality loss.
+    """
+    try:
+        with Image.open(image_path) as img:
+            img = ImageOps.exif_transpose(img)
+            width, height = img.size
+            longer_side = max(width, height)
+            if longer_side <= max_dim:
+                return False
+
+            scale = max_dim / float(longer_side)
+            new_size = (
+                max(1, int(width * scale)),
+                max(1, int(height * scale))
+            )
+            resized = img.resize(new_size, Image.Resampling.LANCZOS)
+            resized.save(image_path, "JPEG", quality=95, optimize=True)
+            return True
+    except Exception as exc:
+        print(f"⚠️ Photo resize skipped ({image_path}): {exc}")
+        return False
+
+
+def clean_photo_border_artifacts(image_path, source_name=None):
+    """
+    Trim uniform scanner borders or text strips around photographs.
+    """
+    try:
+        img = cv2.imread(str(image_path))
+        if img is None:
+            return False
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, mask = cv2.threshold(gray, 235, 255, cv2.THRESH_BINARY_INV)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        img_h, img_w = img.shape[:2]
+        min_trim = max(img_w, img_h) * 0.01
+
+        trimmed = False
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(largest)
+            trim_left = x
+            trim_top = y
+            trim_right = img_w - (x + w)
+            trim_bottom = img_h - (y + h)
+            if (
+                w >= img_w * 0.5
+                and h >= img_h * 0.5
+                and max(trim_left, trim_top, trim_right, trim_bottom) >= min_trim
+            ):
+                pad = 4
+                x1 = max(0, x - pad)
+                y1 = max(0, y - pad)
+                x2 = min(img_w, x + w + pad)
+                y2 = min(img_h, y + h + pad)
+                img = img[y1:y2, x1:x2]
+                gray = gray[y1:y2, x1:x2]
+                img_h, img_w = img.shape[:2]
+                trimmed = True
+
+        if trimmed:
+            _, mask = cv2.threshold(gray, 235, 255, cv2.THRESH_BINARY_INV)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+
+        bottom_band = mask[int(mask.shape[0] * 0.7) :, :]
+        band_ratio = np.mean(bottom_band > 0)
+        if band_ratio > 0.02:
+            rows = np.where(np.sum(mask > 0, axis=1) > mask.shape[1] * 0.02)[0]
+            if rows.size > 0:
+                cutoff = rows[-1]
+                crop_limit = max(cutoff - 5, int(img_h * 0.5))
+                if crop_limit < img_h - 1:
+                    img = img[:crop_limit, :]
+                    trimmed = True
+
+        if trimmed:
+            Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).save(
+                image_path, "JPEG", quality=95, optimize=True
+            )
+            display_name = source_name or Path(image_path).name
+            print(f"ℹ️ Photo border trimmed for original file: {display_name}")
+            return True
+        return False
+    except Exception as exc:
+        print(f"⚠️ Photo border clean skipped ({image_path}): {exc}")
+        return False
+
+
 # Improved signature auto-crop logic
 def autocrop_signature_image(image_path, save_path):
     """
@@ -255,42 +350,167 @@ def autocrop_signature_image(image_path, save_path):
     try:
         img = cv2.imread(str(image_path))
         if img is None:
-            print(f"⚠️ Failed to load image for cropping: {image_path}")
+            print(f"❌ Signature crop failed (unable to read image): {image_path}")
             return False
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        inverted = cv2.bitwise_not(gray)
-        _, thresh = cv2.threshold(inverted, 180, 255, cv2.THRESH_BINARY)
+        gray = cv2.bilateralFilter(gray, 9, 75, 75)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        inverted = cv2.bitwise_not(enhanced)
 
-        # ⚙️ Ignore bottom 20% area (where "Scanned with ..." text usually appears)
-        h, w = thresh.shape
-        ignore_height = int(h * 0.2)
-        thresh[h - ignore_height:, :] = 0  # black out bottom region
+        def build_mask():
+            adaptive = cv2.adaptiveThreshold(
+                inverted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 5
+            )
+            _, otsu = cv2.threshold(
+                inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            edges = cv2.Canny(enhanced, 35, 150)
+            mask_local = cv2.bitwise_or(adaptive, otsu)
+            mask_local = cv2.bitwise_or(mask_local, edges)
+            return mask_local
 
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        def refine_mask(mask_local):
+            h, w = mask_local.shape
+            ignore_bottom = int(h * 0.18)
+            ignore_top = int(h * 0.05)
+            mask_local[h - ignore_bottom :, :] = 0
+            mask_local[:ignore_top, :] = 0
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            mask_local = cv2.morphologyEx(mask_local, cv2.MORPH_CLOSE, kernel, iterations=2)
+            mask_local = cv2.dilate(mask_local, kernel, iterations=1)
+            return mask_local
 
-        if not contours:
-            print("⚠️ No signature contours found.")
+        def best_bbox_from_mask(mask_local, img_shape):
+            contours, _ = cv2.findContours(mask_local, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return None
+
+            h, w = img_shape[:2]
+            total_area = w * h
+            candidates = []
+
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < total_area * 0.0005:  # Lower threshold for better detection
+                    continue
+                x, y, ww, hh = cv2.boundingRect(cnt)
+                aspect = ww / max(1, hh)
+                # Accept wider aspect ratios (signatures are typically wide)
+                if aspect < 1.5:
+                    continue
+                margin = min(x, y, w - (x + ww), h - (y + hh))
+                # Score by area and aspect ratio (prefer wider signatures)
+                score = area * (1 + min(aspect / 2, 8))
+                candidates.append((score, (x, y, ww, hh), margin))
+
+            if not candidates:
+                # Merge all contours and get tight bounding box
+                merged = np.vstack(contours)
+                return cv2.boundingRect(merged)
+
+            candidates.sort(key=lambda c: c[0], reverse=True)
+            # Get the best candidate and refine it to be tighter
+            best_bbox = candidates[0][1]
+            x, y, ww, hh = best_bbox
+            
+            # If multiple candidates, try to merge nearby ones for a tighter box
+            if len(candidates) > 1:
+                merged_points = []
+                for score, (cx, cy, cww, chh), _ in candidates[:3]:  # Top 3 candidates
+                    merged_points.extend([(cx, cy), (cx + cww, cy), (cx, cy + chh), (cx + cww, cy + chh)])
+                if merged_points:
+                    merged_points = np.array(merged_points)
+                    x = int(np.min(merged_points[:, 0]))
+                    y = int(np.min(merged_points[:, 1]))
+                    x2 = int(np.max(merged_points[:, 0]))
+                    y2 = int(np.max(merged_points[:, 1]))
+                    return (x, y, x2 - x, y2 - y)
+            
+            return best_bbox
+
+        mask = refine_mask(build_mask())
+        bbox = best_bbox_from_mask(mask, img.shape)
+
+        if bbox is None:
+            blur_mask = refine_mask(cv2.GaussianBlur(mask, (5, 5), 0))
+            bbox = best_bbox_from_mask(blur_mask, img.shape)
+
+        if bbox is None:
+            projection = np.sum(mask > 0, axis=1)
+            threshold = mask.shape[1] * 0.02
+            rows = np.where(projection > threshold)[0]
+            if rows.size > 0:
+                y1, y2 = rows[0], rows[-1]
+                x_projection = np.sum(mask > 0, axis=0)
+                cols = np.where(x_projection > mask.shape[0] * 0.02)[0]
+                if cols.size > 0:
+                    x1, x2 = cols[0], cols[-1]
+                    bbox = (x1, y1, x2 - x1, y2 - y1)
+
+        if bbox is None:
+            _, simple_thresh = cv2.threshold(gray, 245, 255, cv2.THRESH_BINARY_INV)
+            coords = cv2.findNonZero(simple_thresh)
+            if coords is not None:
+                bbox = cv2.boundingRect(coords)
+                print(f"ℹ️ Signature fallback bbox applied (no watermark cues): {image_path}")
+
+        if bbox is None:
+            print(f"❌ Signature crop failed (no contours detected): {image_path}")
             return False
 
-        # Merge contours
-        x, y, ww, hh = cv2.boundingRect(np.vstack(contours))
+        x, y, ww, hh = bbox
+        h_img, w_img = img.shape[:2]
+        
+        # Refine bounding box by analyzing content density for tighter crop
+        # Extract the detected region and find the tightest box within it
+        try:
+            gray_crop = gray[y:min(y+hh, h_img), x:min(x+ww, w_img)]
+            if gray_crop.size > 0:
+                # Use adaptive threshold to find signature pixels
+                _, refine_mask = cv2.threshold(gray_crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                # Find the tightest box within the detected region
+                rows = np.any(refine_mask > 0, axis=1)
+                cols = np.any(refine_mask > 0, axis=0)
+                if rows.any() and cols.any():
+                    y_min, y_max = np.where(rows)[0][[0, -1]]
+                    x_min, x_max = np.where(cols)[0][[0, -1]]
+                    # Adjust original bbox to the tighter region
+                    x = x + x_min
+                    y = y + y_min
+                    ww = x_max - x_min + 1
+                    hh = y_max - y_min + 1
+        except Exception:
+            # If refinement fails, use the original bbox
+            pass
+        
+        # Tight padding: use small fixed padding or small percentage of signature size (whichever is smaller)
+        # This ensures the crop fits tightly around the signature box with minimal padding
+        pad_x = min(8, max(3, int(ww * 0.05)))  # 5% of signature width, but max 8px, min 3px
+        pad_y = min(8, max(3, int(hh * 0.05)))  # 5% of signature height, but max 8px, min 3px
+        
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(w_img, x + ww + pad_x)
+        y2 = min(h_img, y + hh + pad_y)
 
-        # Padding
-        pad = 50
-        x, y = max(0, x - pad), max(0, y - pad)
-        ww, hh = min(img.shape[1] - x, ww + 2 * pad), min(img.shape[0] - y, hh + 2 * pad)
+        # Validate minimum dimensions
+        min_height = h_img * 0.03
+        min_width = w_img * 0.10
+        if (y2 - y1) < min_height or (x2 - x1) < min_width:
+            print(f"❌ Signature crop failed (bounding box too small): {image_path}")
+            return False
 
-        cropped = img[y:y+hh, x:x+ww]
+        cropped = img[y1:y2, x1:x2]
         cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
         Image.fromarray(cropped).save(save_path, "JPEG", quality=95)
 
-        print(f"✅ Cropped and saved to {save_path}")
+        print(f"✅ Signature cropped precisely (box: {x1},{y1}→{x2},{y2}, padding: {pad_x}x{pad_y}px)")
         return True
 
     except Exception as e:
-        print(f"❌ Auto-crop failed: {e}")
+        print(f"❌ Signature auto-crop runtime error for {image_path}: {e}")
         return False
 
 
@@ -303,16 +523,18 @@ from PIL import Image
 import os
 
 # --- Aadhaar Front Detector ---
-def detect_and_crop_aadhaar_front(image_path, save_path):
+def detect_and_crop_aadhaar_front(image_path, save_path, source_name=None):
     """
     Detect and crop Aadhaar front side intelligently.
     Uses face detection to locate and crop the front side of Aadhaar card.
     """
 
     # ✅ Step 0: Quick filename-based Aadhaar check
-    filename = os.path.basename(image_path).lower()
+    filename_path = Path(source_name) if source_name else Path(image_path)
+    display_name = filename_path.name
+    filename_lower = display_name.lower()
     aadhaar_file_keywords = ["aadhaar", "aadhar", "adhar"]
-    aadhaar_in_name = any(k in filename for k in aadhaar_file_keywords)
+    aadhaar_in_name = any(k in filename_lower for k in aadhaar_file_keywords)
 
     # --- Step 1: Load and preprocess image ---
     img = cv2.imread(image_path)
@@ -360,7 +582,7 @@ def detect_and_crop_aadhaar_front(image_path, save_path):
 
     # If filename doesn't indicate Aadhaar and OCR doesn't detect front, skip
     if not aadhaar_in_name and not front_detected:
-        print("⚠️ Aadhaar not detected in filename or OCR. Skipping Aadhaar crop.")
+        print(f"⚠️ Aadhaar not detected in filename or OCR for '{display_name}'. Skipping Aadhaar crop.")
         return False
 
     # --- Step 3: Face detection to locate photo region (front side has face) ---
@@ -403,7 +625,7 @@ def detect_and_crop_aadhaar_front(image_path, save_path):
         (x, y, w, h) = best_face
         
         if len(all_faces) > 1:
-            print(f"✅ Multiple faces detected ({len(all_faces)}). Selected largest/clearest face for cropping.")
+            print(f"ℹ️ Aadhaar file '{display_name}' has multiple faces ({len(all_faces)}). Selected largest/clearest face for cropping.")
         
         # Expand around face region with increased margins (front side has face on left)
         x1 = max(x - 150, 0)  # Increased left margin from 80 to 150
@@ -411,13 +633,13 @@ def detect_and_crop_aadhaar_front(image_path, save_path):
         x2 = min(x + w + 600, img.shape[1])  # Increased right margin from 400 to 600
         y2 = min(y + h + 300, img.shape[0])  # Increased bottom margin from 200 to 300
         crop = img[y1:y2, x1:x2]
-        print(f"✅ Face detected (size: {w}x{h}) - cropping around face region (front side) with increased margins.")
+        print(f"✅ Aadhaar face detected for '{display_name}' (size: {w}x{h}) - cropping around face region with increased margins.")
     else:
         # Fallback: crop left portion with increased margins (front side typically has photo on left)
         h, w = img.shape[:2]
         # Front side: photo on left, crop with more margin (increased from 5%-65% to 3%-70% width, 5%-95% height)
         crop = img[int(h * 0.05):int(h * 0.95), int(w * 0.03):int(w * 0.70)]
-        print("⚠️ No face detected - cropping left portion (assuming front side) with increased margins.")
+        print(f"⚠️ No face detected for Aadhaar '{display_name}' - cropping left portion with fallback margins.")
 
     # --- Step 4: Save cropped Aadhaar front ---
     im = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
@@ -429,24 +651,47 @@ def detect_and_crop_aadhaar_front(image_path, save_path):
 
 
 # --- Compression ---
-def compress_jpg_to_target(input_path, output_path, min_kb, max_kb):
+def compress_jpg_to_target(input_path, output_path, min_kb, max_kb, category=None):
     """Compress JPEG to target size range."""
     try:
         img = Image.open(input_path)
         img_copy = img.copy()
+        width, height = img_copy.size
+
+        def save_and_check(pil_img, quality):
+            pil_img.save(output_path, 'JPEG', quality=quality, optimize=True)
+            return output_path.stat().st_size / 1024
+
+        if category == "photo":
+            photo_scales = [1.0, 0.9, 0.8, 0.7, 0.6]
+            photo_qualities = [90, 85, 80, 75, 70]
+            for scale in photo_scales:
+                if scale == 1.0:
+                    working_img = img_copy
+                else:
+                    new_size = (
+                        max(1, int(width * scale)),
+                        max(1, int(height * scale))
+                    )
+                    working_img = img_copy.resize(new_size, Image.Resampling.LANCZOS)
+                for quality in photo_qualities:
+                    size_kb = save_and_check(working_img, quality)
+                    if min_kb <= size_kb <= max_kb:
+                        return "ok", size_kb
 
         for quality in range(95, MIN_QUALITY - 1, -5):
-            img_copy.save(output_path, 'JPEG', quality=quality, optimize=True)
-            size_kb = output_path.stat().st_size / 1024
+            size_kb = save_and_check(img_copy, quality)
             if min_kb <= size_kb <= max_kb:
                 return "ok", size_kb
 
         for scale in [0.9, 0.75, 0.5, 0.25]:
-            new_size = (int(img_copy.width * scale), int(img_copy.height * scale))
+            new_size = (
+                max(1, int(width * scale)),
+                max(1, int(height * scale))
+            )
             img_resized = img_copy.resize(new_size, Image.Resampling.LANCZOS)
             for quality in range(90, MIN_QUALITY - 1, -10):
-                img_resized.save(output_path, 'JPEG', quality=quality, optimize=True)
-                size_kb = output_path.stat().st_size / 1024
+                size_kb = save_and_check(img_resized, quality)
                 if min_kb <= size_kb <= max_kb:
                     return "ok", size_kb
 
@@ -490,7 +735,9 @@ def process_tree(source_dir, processed_dir, status_placeholder):
             try:
                 if is_aadhaar_filename(input_path.name):
                     aadhaar_cropped_path = Path(tempfile.gettempdir()) / f"aadhaar_{uuid.uuid4().hex}_{relative_path.name}.jpg"
-                    success = detect_and_crop_aadhaar_front(temp_jpg_path, aadhaar_cropped_path)
+                    success = detect_and_crop_aadhaar_front(
+                        temp_jpg_path, aadhaar_cropped_path, source_name=str(relative_path)
+                    )
                     if success:
                         temp_jpg_path = aadhaar_cropped_path
                     else:
@@ -503,6 +750,12 @@ def process_tree(source_dir, processed_dir, status_placeholder):
                 cropped_path = Path(tempfile.gettempdir()) / f"cropped_{uuid.uuid4().hex}_{relative_path.name}.jpg"
                 if autocrop_signature_image(temp_jpg_path, cropped_path):
                     temp_jpg_path = cropped_path
+                else:
+                    print(f"⚠️ Signature auto-crop skipped for {input_path.name}; continuing with original image.")
+
+            if category == "photo":
+                clean_photo_border_artifacts(temp_jpg_path, source_name=str(relative_path))
+                shrink_photo_if_needed(temp_jpg_path)
 
             output_path = (processed_dir / relative_path).with_suffix(".jpg")
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -518,7 +771,7 @@ def process_tree(source_dir, processed_dir, status_placeholder):
                 report_data.append([str(relative_path), category, f"{original_kb:.2f}", f"{final_kb:.2f}", status, "name"])
             else:
                 # File is outside target size - compress to target
-                status, final_kb = compress_jpg_to_target(temp_jpg_path, output_path, min_kb, max_kb)
+                status, final_kb = compress_jpg_to_target(temp_jpg_path, output_path, min_kb, max_kb, category=category)
                 report_data.append([str(relative_path), category, f"{original_kb:.2f}", f"{final_kb:.2f}", status, "name"])
 
             try:
@@ -569,6 +822,8 @@ if uploaded_file is not None and not st.session_state.get("processed", False):
         st.session_state.start_processing = True
 
 if uploaded_file is not None and st.session_state.get("start_processing", False):
+    banner = f"\n{'=' * 20} NEW FILE RUN: {uploaded_file.name} {'=' * 20}\n"
+    print(banner)
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         src_dir = temp_path / "source"
