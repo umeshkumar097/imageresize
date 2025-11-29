@@ -180,7 +180,7 @@ CATEGORY_KEYWORDS = {
 }
 
 SUPPORTED_MEDIA_EXT = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.pdf']
-MIN_QUALITY = 10
+MIN_QUALITY = 85  # Minimum quality for lossless/near-lossless compression
 PHOTO_MAX_DIM = 1600
 DPI = 200
 
@@ -239,7 +239,7 @@ def convert_any_to_jpg(input_path, output_jpg_path):
                 img = ImageOps.exif_transpose(img)
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
-                img.save(output_jpg_path, 'JPEG')
+                img.save(output_jpg_path, 'JPEG', quality=95, optimize=True)
             return True
 
         return False
@@ -643,7 +643,7 @@ def detect_and_crop_aadhaar_front(image_path, save_path, source_name=None):
 
     # --- Step 4: Save cropped Aadhaar front ---
     im = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-    im.save(save_path, "JPEG", quality=90)
+    im.save(save_path, "JPEG", quality=95, optimize=True)
 
     print(f"✅ Cropped Aadhaar front saved: {save_path}")
     return True
@@ -652,7 +652,7 @@ def detect_and_crop_aadhaar_front(image_path, save_path, source_name=None):
 
 # --- Compression ---
 def compress_jpg_to_target(input_path, output_path, min_kb, max_kb, category=None):
-    """Compress JPEG to target size range."""
+    """Compress JPEG to target size range using lossless/near-lossless quality methods."""
     try:
         img = Image.open(input_path)
         img_copy = img.copy()
@@ -662,39 +662,53 @@ def compress_jpg_to_target(input_path, output_path, min_kb, max_kb, category=Non
             pil_img.save(output_path, 'JPEG', quality=quality, optimize=True)
             return output_path.stat().st_size / 1024
 
+        # Strategy: Prioritize quality over size reduction
+        # Start with maximum quality (100 = visually lossless) and only reduce if needed
+        
+        # Step 1: Try maximum quality first (lossless/near-lossless)
+        size_kb = save_and_check(img_copy, 100)
+        if min_kb <= size_kb <= max_kb:
+            return "ok", size_kb
+        
+        # Step 2: If too large, try quality 95 (still visually lossless)
+        size_kb = save_and_check(img_copy, 95)
+        if min_kb <= size_kb <= max_kb:
+            return "ok", size_kb
+        
+        # Step 3: For photos, prefer resizing over quality reduction
         if category == "photo":
-            photo_scales = [1.0, 0.9, 0.8, 0.7, 0.6]
-            photo_qualities = [90, 85, 80, 75, 70]
+            photo_scales = [0.95, 0.9, 0.85, 0.8, 0.75, 0.7]
+            photo_qualities = [95, 92, 90, 88, 85]  # High quality range
             for scale in photo_scales:
-                if scale == 1.0:
-                    working_img = img_copy
-                else:
-                    new_size = (
-                        max(1, int(width * scale)),
-                        max(1, int(height * scale))
-                    )
-                    working_img = img_copy.resize(new_size, Image.Resampling.LANCZOS)
+                new_size = (
+                    max(1, int(width * scale)),
+                    max(1, int(height * scale))
+                )
+                working_img = img_copy.resize(new_size, Image.Resampling.LANCZOS)
                 for quality in photo_qualities:
                     size_kb = save_and_check(working_img, quality)
                     if min_kb <= size_kb <= max_kb:
                         return "ok", size_kb
-
-        for quality in range(95, MIN_QUALITY - 1, -5):
+        
+        # Step 4: For other categories, try slight quality reduction with original size
+        for quality in range(92, MIN_QUALITY - 1, -2):  # Smaller steps to preserve quality
             size_kb = save_and_check(img_copy, quality)
             if min_kb <= size_kb <= max_kb:
                 return "ok", size_kb
-
-        for scale in [0.9, 0.75, 0.5, 0.25]:
+        
+        # Step 5: If still too large, combine resizing with high quality
+        for scale in [0.95, 0.9, 0.85, 0.8, 0.75]:
             new_size = (
                 max(1, int(width * scale)),
                 max(1, int(height * scale))
             )
             img_resized = img_copy.resize(new_size, Image.Resampling.LANCZOS)
-            for quality in range(90, MIN_QUALITY - 1, -10):
+            for quality in range(90, MIN_QUALITY - 1, -3):
                 size_kb = save_and_check(img_resized, quality)
                 if min_kb <= size_kb <= max_kb:
                     return "ok", size_kb
 
+        # Last resort: minimum quality (but still above very low thresholds)
         img_copy.save(output_path, 'JPEG', quality=MIN_QUALITY, optimize=True)
         return "ok", output_path.stat().st_size / 1024
     except Exception:
