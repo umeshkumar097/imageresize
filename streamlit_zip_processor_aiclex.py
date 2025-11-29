@@ -652,7 +652,26 @@ def detect_and_crop_aadhaar_front(image_path, save_path, source_name=None):
 
 # --- Compression ---
 def compress_jpg_to_target(input_path, output_path, min_kb, max_kb, category=None):
-    """Compress JPEG to target size range using lossless/near-lossless quality methods."""
+    """Compress JPEG to target size range with MINIMUM QUALITY LOSS.
+    
+    Optimization Strategy (Quality-First Approach):
+    1. Try maximum quality (100) first - visually lossless
+    2. Try quality 95 - still visually lossless
+    3. PREFER RESIZING over quality reduction (preserves quality per pixel)
+       - Progressive resizing (98% → 96% → 94%...) with high quality (90-100)
+       - Fine quality steps (100, 98, 96, 95, 94...) to find optimal balance
+    4. Only reduce quality below 90 as last resort
+    5. Maintain quality above 85 whenever possible
+    
+    Quality Levels:
+    - 95-100: Visually lossless (imperceptible to human eye)
+    - 90-94: Excellent quality (minimal visible difference)
+    - 85-89: High quality (very good, slight compression artifacts)
+    - 80-84: Good quality (acceptable for most uses)
+    - Below 80: Only used as absolute last resort
+    
+    Note: This strategy minimizes quality loss while meeting size targets.
+    """
     try:
         img = Image.open(input_path)
         img_copy = img.copy()
@@ -661,6 +680,18 @@ def compress_jpg_to_target(input_path, output_path, min_kb, max_kb, category=Non
         def save_and_check(pil_img, quality):
             pil_img.save(output_path, 'JPEG', quality=quality, optimize=True)
             return output_path.stat().st_size / 1024
+
+        # Check if file is already too small (below minimum)
+        # Try increasing quality slightly to see if we can reach minimum
+        initial_size = input_path.stat().st_size / 1024
+        if initial_size < min_kb:
+            # Try maximum quality to see if it helps
+            size_kb = save_and_check(img_copy, 100)
+            if min_kb <= size_kb <= max_kb:
+                return "ok", size_kb
+            elif size_kb < min_kb:
+                # Even at max quality, still too small - return as-is
+                return "too_small", size_kb
 
         # Strategy: Prioritize quality over size reduction
         # Start with maximum quality (100 = visually lossless) and only reduce if needed
@@ -675,42 +706,92 @@ def compress_jpg_to_target(input_path, output_path, min_kb, max_kb, category=Non
         if min_kb <= size_kb <= max_kb:
             return "ok", size_kb
         
-        # Step 3: For photos, prefer resizing over quality reduction
-        if category == "photo":
-            photo_scales = [0.95, 0.9, 0.85, 0.8, 0.75, 0.7]
-            photo_qualities = [95, 92, 90, 88, 85]  # High quality range
-            for scale in photo_scales:
-                new_size = (
-                    max(1, int(width * scale)),
-                    max(1, int(height * scale))
-                )
-                working_img = img_copy.resize(new_size, Image.Resampling.LANCZOS)
-                for quality in photo_qualities:
-                    size_kb = save_and_check(working_img, quality)
-                    if min_kb <= size_kb <= max_kb:
-                        return "ok", size_kb
+        # Step 3: PREFER RESIZING OVER QUALITY REDUCTION (for all categories)
+        # This preserves quality per pixel while reducing file size
+        # Try progressive resizing with maximum quality first
         
-        # Step 4: For other categories, try slight quality reduction with original size
-        for quality in range(92, MIN_QUALITY - 1, -2):  # Smaller steps to preserve quality
-            size_kb = save_and_check(img_copy, quality)
-            if min_kb <= size_kb <= max_kb:
-                return "ok", size_kb
+        # Start with high quality (95-100) and resize gradually
+        high_qualities = [100, 98, 96, 95, 94, 93, 92, 91, 90]  # Very fine steps
+        resize_scales = [0.98, 0.96, 0.94, 0.92, 0.90, 0.88, 0.85, 0.82, 0.80, 
+                         0.78, 0.75, 0.72, 0.70, 0.68, 0.65, 0.62, 0.60, 0.58, 0.55]
         
-        # Step 5: If still too large, combine resizing with high quality
-        for scale in [0.95, 0.9, 0.85, 0.8, 0.75]:
+        # Strategy: For each resize scale, try highest quality first, then reduce slightly
+        for scale in resize_scales:
             new_size = (
                 max(1, int(width * scale)),
                 max(1, int(height * scale))
             )
+            # Skip if image becomes too small
+            if new_size[0] < 100 or new_size[1] < 100:
+                break
+                
             img_resized = img_copy.resize(new_size, Image.Resampling.LANCZOS)
-            for quality in range(90, MIN_QUALITY - 1, -3):
+            
+            # Try highest quality first, then reduce slightly if needed
+            for quality in high_qualities:
+                size_kb = save_and_check(img_resized, quality)
+                if min_kb <= size_kb <= max_kb:
+                    return "ok", size_kb
+                # If still too large, try next quality level
+                if size_kb > max_kb:
+                    continue
+                # If too small, this scale won't work, try next scale
+                break
+        
+        # Step 4: If resizing with high quality didn't work, try more aggressive resizing
+        # but still maintain quality above 85
+        aggressive_scales = [0.50, 0.45, 0.40, 0.35, 0.30, 0.25]
+        medium_qualities = [90, 88, 86, 85]  # Still maintain high quality
+        
+        for scale in aggressive_scales:
+            new_size = (
+                max(1, int(width * scale)),
+                max(1, int(height * scale))
+            )
+            if new_size[0] < 50 or new_size[1] < 50:
+                break
+            img_resized = img_copy.resize(new_size, Image.Resampling.LANCZOS)
+            for quality in medium_qualities:
                 size_kb = save_and_check(img_resized, quality)
                 if min_kb <= size_kb <= max_kb:
                     return "ok", size_kb
 
-        # Last resort: minimum quality (but still above very low thresholds)
-        img_copy.save(output_path, 'JPEG', quality=MIN_QUALITY, optimize=True)
-        return "ok", output_path.stat().st_size / 1024
+        # Step 5: Last resort - very aggressive resizing but still maintain quality 85+
+        # Only go below 85 if absolutely necessary
+        extreme_scales = [0.20, 0.18, 0.15, 0.12, 0.10]
+        for scale in extreme_scales:
+            new_size = (
+                max(1, int(width * scale)),
+                max(1, int(height * scale))
+            )
+            if new_size[0] < 30 or new_size[1] < 30:  # Minimum reasonable size
+                break
+            img_resized = img_copy.resize(new_size, Image.Resampling.LANCZOS)
+            # Try quality 85 first, then reduce only if needed
+            for quality in [85, 83, 80]:
+                size_kb = save_and_check(img_resized, quality)
+                if min_kb <= size_kb <= max_kb:
+                    return "ok", size_kb
+
+        # Final attempt: Try original size with quality reduction (last resort)
+        # But still try to maintain quality above 80
+        for quality in range(90, 79, -1):  # Fine steps, quality 90 down to 80
+            size_kb = save_and_check(img_copy, quality)
+            if min_kb <= size_kb <= max_kb:
+                return "ok", size_kb
+        
+        # Absolute last resort: minimum quality with original size
+        final_size_kb = save_and_check(img_copy, MIN_QUALITY)
+        
+        # Validate if final size is within range
+        if min_kb <= final_size_kb <= max_kb:
+            return "ok", final_size_kb
+        elif final_size_kb < min_kb:
+            # File is too small - this shouldn't happen often, but log it
+            return "too_small", final_size_kb
+        else:
+            # File is still too large even after all attempts
+            return "too_large", final_size_kb
     except Exception:
         return "compress_failed", 0
 # --- Helper: Aadhaar filename detection ---
@@ -786,6 +867,22 @@ def process_tree(source_dir, processed_dir, status_placeholder):
             else:
                 # File is outside target size - compress to target
                 status, final_kb = compress_jpg_to_target(temp_jpg_path, output_path, min_kb, max_kb, category=category)
+                
+                # Validate final size and update status if needed
+                if status == "ok":
+                    # Double-check the size is actually within range
+                    if not (min_kb <= final_kb <= max_kb):
+                        if final_kb < min_kb:
+                            status = "too_small"
+                            print(f"⚠️ {category} '{input_path.name}' compressed to {final_kb:.2f} KB (below min {min_kb} KB)")
+                        else:
+                            status = "too_large"
+                            print(f"⚠️ {category} '{input_path.name}' compressed to {final_kb:.2f} KB (above max {max_kb} KB)")
+                elif status == "too_small":
+                    print(f"⚠️ {category} '{input_path.name}' is too small ({final_kb:.2f} KB < {min_kb} KB) - cannot increase size")
+                elif status == "too_large":
+                    print(f"⚠️ {category} '{input_path.name}' is too large ({final_kb:.2f} KB > {max_kb} KB) - maximum compression applied")
+                
                 report_data.append([str(relative_path), category, f"{original_kb:.2f}", f"{final_kb:.2f}", status, "name"])
 
             try:
